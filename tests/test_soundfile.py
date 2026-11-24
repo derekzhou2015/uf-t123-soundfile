@@ -343,6 +343,151 @@ def test_write_mp3_compression():
     sf.write(filename_mp3, data_stereo, sr, format='MP3', subtype='MPEG_LAYER_III')
 
 
+def _mp3_frame_bitrates(filename):
+    """Return the bitrate (kbps) of every MPEG-1 Layer III frame header.
+
+    Walks the frame chain from the first frame after the ID3v2 tag, so the
+    result reflects the encoder's real bitrate decisions rather than file size.
+    """
+    with open(filename, 'rb') as f:
+        content = f.read()
+    pos = 0
+    if content[:3] == b'ID3':
+        size = ((content[6] & 0x7f) << 21 | (content[7] & 0x7f) << 14 |
+                (content[8] & 0x7f) << 7 | (content[9] & 0x7f))
+        pos = 10 + size
+    kbps_table = [None, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192,
+                  224, 256, 320]
+    samplerates = [44100, 48000, 32000]
+    bitrates = []
+    while pos + 4 <= len(content):
+        header = int.from_bytes(content[pos:pos + 4], 'big')
+        version = (header >> 19) & 0x3
+        layer = (header >> 17) & 0x3
+        bitrate_index = (header >> 12) & 0xf
+        samplerate_index = (header >> 10) & 0x3
+        padding = (header >> 9) & 0x1
+        if (version != 0x3 or layer != 0x1 or samplerate_index == 0x3
+                or bitrate_index in (0x0, 0xf)):
+            pos += 1
+            continue
+        bitrates.append(kbps_table[bitrate_index])
+        pos += int(144 * kbps_table[bitrate_index] * 1000 /
+                   samplerates[samplerate_index]) + padding
+    return bitrates
+
+
+@pytest.mark.parametrize("bitrate_mode", ['CONSTANT', 'AVERAGE', 'VARIABLE'])
+def test_write_mp3_bitrate_mode_without_compression_level(tmp_path, bitrate_mode):
+    """A lone bitrate_mode must be applied, not silently discarded."""
+    sr = 44100
+    filename_plain = str(tmp_path / 'bitrate_plain.mp3')
+    filename_mode = str(tmp_path / 'bitrate_mode.mp3')
+
+    # A tone plus noise gives the VBR encoder something to vary the bitrate
+    # on, so the default writing path has more than one frame bitrate.
+    duration = 0.5
+    samples = int(sr * duration)
+    t = np.arange(samples) / sr
+    rng = np.random.default_rng(0)
+    data = np.stack([np.sin(2 * np.pi * 440 * t) + 0.02 * rng.standard_normal(samples),
+                     np.sin(2 * np.pi * 660 * t) + 0.02 * rng.standard_normal(samples)],
+                    axis=1)
+
+    sf.write(filename_plain, data, sr,
+             format='MP3', subtype='MPEG_LAYER_III')
+    sf.write(filename_mode, data, sr,
+             format='MP3', subtype='MPEG_LAYER_III',
+             bitrate_mode=bitrate_mode)
+
+    default_bitrates = _mp3_frame_bitrates(filename_plain)
+    mode_bitrates = _mp3_frame_bitrates(filename_mode)
+    assert len(mode_bitrates) >= 2
+    assert len(set(default_bitrates)) > 1
+
+    if bitrate_mode == 'CONSTANT':
+        # Every frame header must advertise the same bitrate, and the frame
+        # chain must not look like the untouched VBR default anymore.
+        assert len(set(mode_bitrates)) == 1
+        assert mode_bitrates != default_bitrates
+    elif bitrate_mode == 'AVERAGE':
+        # AVERAGE changes the encoder decisions compared to the default.
+        assert mode_bitrates != default_bitrates
+    else:  # VARIABLE
+        # VARIABLE without a compression level equals libsndfile's default
+        # writing path byte for byte.
+        with open(filename_plain, 'rb') as f:
+            default_bytes = f.read()
+        with open(filename_mode, 'rb') as f:
+            assert f.read() == default_bytes
+
+
+def test_write_mp3_bitrate_mode_with_compression_level_is_unchanged():
+    """The paired (mode + compression level) path keeps its behavior."""
+    sr = 44100
+    try:
+        sf.write(filename_mp3, data_stereo, sr,
+                 format='MP3', subtype='MPEG_LAYER_III',
+                 compression_level=0.5, bitrate_mode='CONSTANT')
+        constant_bitrates = _mp3_frame_bitrates(filename_mp3)
+        assert len(constant_bitrates) > 1
+        # CONSTANT + compression level yields a single frame bitrate.
+        assert len(set(constant_bitrates)) == 1
+
+        sf.write(filename_mp3, data_stereo, sr,
+                 format='MP3', subtype='MPEG_LAYER_III',
+                 compression_level=0.5, bitrate_mode='VARIABLE')
+        assert len(set(_mp3_frame_bitrates(filename_mp3))) > 1
+    finally:
+        sf.write(filename_mp3, data_stereo, sr,
+                 format='MP3', subtype='MPEG_LAYER_III')
+
+
+def test_write_mp3_without_bitrate_mode_is_unchanged(tmp_path):
+    """Writing without bitrate arguments no longer forces a bitrate mode."""
+    sr = 44100
+    filename = str(tmp_path / 'plain.mp3')
+    sf.write(filename, data_stereo, sr, format='MP3', subtype='MPEG_LAYER_III')
+    bitrates = _mp3_frame_bitrates(filename)
+    assert len(bitrates) > 1
+    # The default writing path was not sent a bitrate mode command, so its
+    # frame bitrates are not forced to a single value.
+    assert len(set(bitrates)) > 1
+
+
+@pytest.mark.parametrize("format,subtype,extension", [
+    ('WAV', 'PCM_16', 'wav'),
+    ('FLAC', 'PCM_16', 'flac'),
+    ('OGG', 'VORBIS', 'ogg'),
+])
+def test_write_bitrate_mode_unsupported_format_raises(
+        tmp_path, format, subtype, extension):
+    """Formats without bitrate modes must report the unsupported setting."""
+    filename = str(tmp_path / ('bitrate.' + extension))
+    with pytest.raises(sf.LibsndfileError) as excinfo:
+        sf.write(filename, data_stereo, 44100, format=format,
+                 subtype=subtype, bitrate_mode='CONSTANT')
+    assert 'bitrate mode' in str(excinfo.value)
+
+
+def test_write_compression_level_on_wav_still_raises(tmp_path):
+    """The pre-existing compression_level error surface is unchanged."""
+    filename = str(tmp_path / 'compression.wav')
+    with pytest.raises(sf.LibsndfileError) as excinfo:
+        sf.write(filename, data_stereo, 44100, format='WAV',
+                 subtype='PCM_16', compression_level=0.5)
+    assert 'compression' in str(excinfo.value)
+
+
+def test_write_invalid_bitrate_mode_raises_value_error(tmp_path):
+    """An unknown bitrate_mode is rejected regardless of assert stripping."""
+    filename = str(tmp_path / 'invalid.mp3')
+    with pytest.raises(ValueError) as excinfo:
+        sf.write(filename, data_stereo, 44100, format='MP3',
+                 subtype='MPEG_LAYER_III', bitrate_mode='CONSTANT_BITRATE')
+    assert 'bitrate_mode' in str(excinfo.value)
+
+
 def test_write_flac_compression():
     sr = 44100
     # Compression requires a certain size
