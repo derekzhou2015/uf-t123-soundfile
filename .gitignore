@@ -1,0 +1,12 @@
+*.pyc
+__pycache__/
+dist/
+build/
+.eggs/
+*.egg-info/
+.cache/
+.vscode/
+.DS_Store
+.venv/
+tests/
+_soundfile.py
