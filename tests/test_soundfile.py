@@ -343,6 +343,120 @@ def test_write_mp3_compression():
     sf.write(filename_mp3, data_stereo, sr, format='MP3', subtype='MPEG_LAYER_III')
 
 
+def _mp3_frame_bitrates(path):
+    """Return the distinct bitrate indices of all MPEG-1 Layer III frames."""
+    with open(path, 'rb') as f:
+        raw = f.read()
+    bitrate_table = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192,
+                     224, 256, 320, 0]
+    indices = []
+    pos = 0
+    while pos + 4 <= len(raw):
+        # frame sync, MPEG-1 (version bits 11), Layer III, valid bitrate index
+        if (raw[pos] == 0xFF and (raw[pos + 1] & 0xE0) == 0xE0
+                and (raw[pos + 1] >> 3) & 0x3 == 0x3
+                and (raw[pos + 1] >> 1) & 0x3 == 1
+                and (raw[pos + 2] >> 4) & 0xF not in (0, 15)):
+            index = (raw[pos + 2] >> 4) & 0xF
+            indices.append(index)
+            samplerate_index = (raw[pos + 2] >> 2) & 0x3
+            samplerate = [44100, 48000, 32000][samplerate_index]
+            padding = (raw[pos + 2] >> 1) & 0x1
+            pos += 144 * bitrate_table[index] * 1000 // samplerate + padding
+        else:
+            pos += 1
+    return set(indices), len(indices)
+
+
+def test_write_mp3_bitrate_mode_without_compression_level(tmp_path):
+    """A lone bitrate_mode must take effect instead of being silently dropped."""
+    sr = 44100
+    rng = np.random.default_rng(0)
+    data = rng.standard_normal((sr, 2)).astype(np.float32)
+
+    default_file = str(tmp_path / 'default.mp3')
+    constant_file = str(tmp_path / 'constant.mp3')
+    average_file = str(tmp_path / 'average.mp3')
+    variable_file = str(tmp_path / 'variable.mp3')
+
+    sf.write(default_file, data, sr, format='MP3', subtype='MPEG_LAYER_III')
+    sf.write(constant_file, data, sr, format='MP3',
+             subtype='MPEG_LAYER_III', bitrate_mode='CONSTANT')
+    sf.write(average_file, data, sr, format='MP3',
+             subtype='MPEG_LAYER_III', bitrate_mode='AVERAGE')
+    sf.write(variable_file, data, sr, format='MP3',
+             subtype='MPEG_LAYER_III', bitrate_mode='VARIABLE')
+
+    default_bitrates, default_frames = _mp3_frame_bitrates(default_file)
+    constant_bitrates, constant_frames = _mp3_frame_bitrates(constant_file)
+    average_bitrates, average_frames = _mp3_frame_bitrates(average_file)
+    variable_bitrates, variable_frames = _mp3_frame_bitrates(variable_file)
+
+    assert default_frames == constant_frames == average_frames == variable_frames
+
+    # Before the fix, the lone bitrate_mode was dropped and the file was
+    # byte-identical to the default (variable bitrate) output.
+    with open(default_file, 'rb') as f:
+        default_bytes = f.read()
+    with open(constant_file, 'rb') as f:
+        constant_bytes = f.read()
+    assert constant_bytes != default_bytes
+    assert len(constant_bitrates) == 1  # constant bitrate: one frame rate
+    assert constant_bitrates != default_bitrates
+    assert average_bitrates != default_bitrates
+    # VARIABLE is libsndfile's default, so it matches the default output.
+    with open(variable_file, 'rb') as f:
+        variable_bytes = f.read()
+    assert variable_bytes == default_bytes
+
+
+def test_write_mp3_bitrate_mode_with_compression_level(tmp_path):
+    """The paired form keeps working and stays distinct from the lone form."""
+    sr = 44100
+    rng = np.random.default_rng(0)
+    data = rng.standard_normal((sr, 2)).astype(np.float32)
+
+    constant_file = str(tmp_path / 'pair_constant.mp3')
+    variable_file = str(tmp_path / 'pair_variable.mp3')
+
+    sf.write(constant_file, data, sr, format='MP3', subtype='MPEG_LAYER_III',
+             compression_level=0, bitrate_mode='CONSTANT')
+    sf.write(variable_file, data, sr, format='MP3', subtype='MPEG_LAYER_III',
+             compression_level=0, bitrate_mode='VARIABLE')
+
+    constant_bitrates, _ = _mp3_frame_bitrates(constant_file)
+    variable_bitrates, _ = _mp3_frame_bitrates(variable_file)
+    assert len(constant_bitrates) == 1
+    assert len(variable_bitrates) > 1
+    assert os.path.getsize(variable_file) < os.path.getsize(constant_file)
+
+
+def test_write_mp3_bitrate_mode_attribute_matches_output(tmp_path):
+    """The echoed property must describe what was actually applied."""
+    sr = 44100
+    data = np.zeros((sr, 2), dtype=np.float32)
+    filename = str(tmp_path / 'attribute.mp3')
+    with sf.SoundFile(filename, 'w', sr, 2, format='MP3',
+                      subtype='MPEG_LAYER_III', bitrate_mode='CONSTANT') as f:
+        f.write(data)
+        assert f.bitrate_mode == 'CONSTANT'
+        assert "bitrate_mode='CONSTANT'" in repr(f)
+    bitrates, _ = _mp3_frame_bitrates(filename)
+    assert len(bitrates) == 1
+
+
+def test_write_bitrate_mode_unsupported_format_raises(tmp_path):
+    """A lone bitrate_mode must never be silently dropped."""
+    sr = 44100
+    data = np.zeros((sr, 2), dtype=np.float32)
+    for fmt, subtype in [('WAV', 'PCM_16'), ('FLAC', 'PCM_16'),
+                         ('OGG', 'VORBIS')]:
+        filename = str(tmp_path / f'unsupported.{fmt.lower()}')
+        with pytest.raises(sf.LibsndfileError):
+            sf.write(filename, data, sr, format=fmt, subtype=subtype,
+                     bitrate_mode='CONSTANT')
+
+
 def test_write_flac_compression():
     sr = 44100
     # Compression requires a certain size

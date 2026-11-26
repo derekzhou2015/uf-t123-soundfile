@@ -669,7 +669,10 @@ class SoundFile:
             (highest compression level).
             See `libsndfile document <https://github.com/libsndfile/libsndfile/blob/c81375f070f3c6764969a738eacded64f53a076e/docs/command.md>`__.
         bitrate_mode : {'CONSTANT', 'AVERAGE', 'VARIABLE'}, optional
-            The bitrate mode on 'write()'.
+            The bitrate mode on 'write()'.  It can be given on its own, in
+            which case the encoder's default bitrate is used, or together
+            with `compression_level`.  Formats whose encoder does not
+            support a bitrate mode raise a `LibsndfileError`.
             See `libsndfile document <https://github.com/libsndfile/libsndfile/blob/c81375f070f3c6764969a738eacded64f53a076e/docs/command.md>`__.
 
         Examples
@@ -717,8 +720,10 @@ class SoundFile:
         if self._compression_level is not None:
             # needs to be called before set_bitrate_mode
             self._set_compression_level(self._compression_level)
-            if self._bitrate_mode is not None:
-                self._set_bitrate_mode(self._bitrate_mode)
+        # set_bitrate_mode is independent of the compression level: it must
+        # not be dropped just because no compression level was requested.
+        if self._bitrate_mode is not None:
+            self._set_bitrate_mode(self._bitrate_mode)
 
     name = property(lambda self: self._name)
     """The file name of the sound file."""
@@ -1498,14 +1503,35 @@ class SoundFile:
 
     def _set_bitrate_mode(self, bitrate_mode):
         """Call libsndfile's set bitrate mode function."""
-        assert bitrate_mode in _bitrate_modes
+        if bitrate_mode not in _bitrate_modes:
+            raise ValueError(f"Invalid bitrate mode: {bitrate_mode!r}")
 
         pointer_bitrate_mode = _ffi.new("int[1]")
         pointer_bitrate_mode[0] = _bitrate_modes[bitrate_mode]
-        err = _snd.sf_command(self._file, _snd.SFC_SET_BITRATE_MODE, pointer_bitrate_mode, _ffi.sizeof(pointer_bitrate_mode))
-        if err != _snd.SF_TRUE:
-            err = _snd.sf_error(self._file)
-            raise LibsndfileError(err, f"Error set bitrate mode {bitrate_mode}")
+        ret = _snd.sf_command(self._file, _snd.SFC_SET_BITRATE_MODE, pointer_bitrate_mode, _ffi.sizeof(pointer_bitrate_mode))
+        if ret == _snd.SF_TRUE:
+            return
+
+        # libsndfile 1.2.2 applies the requested mode but still returns
+        # SF_FALSE when no compression level was set beforehand: the command
+        # re-evaluates the (still unset) compression level, which is out of
+        # range.  The encoder state is correct in that case, so verify it
+        # instead of discarding the setting or reporting a bogus failure.
+        # Only MPEG files implement SFC_SET_BITRATE_MODE (mpeg.c); other
+        # formats report a constant default from SFC_GET_BITRATE_MODE
+        # regardless of what was requested, so limit the verification to MP3.
+        err = _snd.sf_error(self._file)
+        if (err == 0 and self.format == 'MP3'
+                and self._get_bitrate_mode() == _bitrate_modes[bitrate_mode]):
+            return
+        raise LibsndfileError(err, f"Error set bitrate mode {bitrate_mode}")
+
+    def _get_bitrate_mode(self):
+        """Query libsndfile for the currently active bitrate mode."""
+        pointer_bitrate_mode = _ffi.new("int[1]")
+        return _snd.sf_command(self._file, _snd.SFC_GET_BITRATE_MODE,
+                               pointer_bitrate_mode,
+                               _ffi.sizeof(pointer_bitrate_mode))
 
 
     def _set_compression_level(self, compression_level):
